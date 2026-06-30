@@ -63,6 +63,7 @@ class DiskFilesystem extends Filesystem {
 				await writeFile(tmp, content, "utf-8");
 				await rename(tmp, cp);
 			} catch (e) {
+				console.error("pi-hashline-omp: writeText atomic error:", e);
 				try { await unlink(tmp); } catch (e) { console.error("pi-hashline-omp: unlink temp error:", e); }
 				throw e;
 			}
