@@ -1,0 +1,45 @@
+{
+  "name": "pi-hashline-omp",
+  "version": "0.1.0",
+  "description": "Full oh-my-pi hashline editing for pi coding agent — hash-anchored reads, text-DSL edits, tree-sitter block ops, and grep integration",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bml/pi-hashline-omp.git"
+  },
+  "author": "bml",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "coding-agent",
+    "extension",
+    "hashline",
+    "oh-my-pi"
+  ],
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "src",
+    "prompts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "@oh-my-pi/hashline": "^16.2.5"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  }
+}

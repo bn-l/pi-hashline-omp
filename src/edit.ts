@@ -1,0 +1,224 @@
+/**
+ * Hashline edit tool — overrides pi's built-in edit.
+ *
+ * Accepts hashline patch language input:
+ *   [path#A1B2]
+ *   SWAP 2.=2:
+ *   +new line content
+ *
+ * Validates snapshot tags, applies edits via the Patcher, and returns
+ * compact results with fresh anchors for follow-up edits.
+ */
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { resolve } from "node:path";
+import {
+	Patcher,
+	Patch,
+	buildCompactDiffPreview,
+	computeFileHash,
+	formatHashlineHeader,
+	type BlockResolver,
+	type Filesystem,
+	type InMemorySnapshotStore,
+	type WriteResult,
+} from "@oh-my-pi/hashline";
+import { readFile, writeFile, rename, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { dirname } from "node:path";
+
+/**
+ * Minimal Filesystem implementation backed by the real disk.
+ * Writes atomically via temp-file-then-rename.
+ */
+class DiskFilesystem implements Filesystem {
+	canonicalPath(p: string): string {
+		try {
+			return resolve(p);
+		} catch {
+			return p;
+		}
+	}
+
+	async readText(p: string): Promise<string> {
+		return readFile(p, "utf-8");
+	}
+
+	async writeText(p: string, content: string): Promise<WriteResult> {
+		// Atomic write via temp file
+		const dir = dirname(p);
+		const tmp = `${dir}/.pi-hashline-${randomUUID()}.tmp`;
+		try {
+			await writeFile(tmp, content, "utf-8");
+			await rename(tmp, p);
+		} catch (e) {
+			try { await unlink(tmp); } catch {}
+			throw e;
+		}
+		return { text: content };
+	}
+
+	async delete(p: string): Promise<void> {
+		await unlink(p);
+	}
+
+	async move(source: string, dest: string, content: string): Promise<void> {
+		await writeFile(dest, content, "utf-8");
+		await unlink(source);
+	}
+
+	async preflightWrite(_path: string, _options?: { fileOp?: { kind: string } }): Promise<void> {
+		// No permission checks for now
+	}
+
+	allowTagPathRecovery(_authoredPath: string, _recoveredPath: string): boolean {
+		return true;
+	}
+}
+
+let noopCounts = new Map<string, { hash: string; count: number }>();
+const NOOP_HARD_LIMIT = 3;
+
+export function registerEditTool(
+	pi: ExtensionAPI,
+	snapshots: InMemorySnapshotStore,
+	blockResolver: BlockResolver,
+) {
+	pi.registerTool({
+		name: "edit",
+		label: "Edit",
+		description:
+			"Edit files using the hashline patch language. Input must start with [PATH#TAG] " +
+			"section headers followed by SWAP/DEL/INS operations. " +
+			"TAG is the 4-hex hash from your latest read/grep/edit output. " +
+			"Operations: SWAP N.=M: replace lines, DEL N.=M delete lines, " +
+			"INS.PRE/POST/HEAD/TAIL: insert, SWAP.BLK N:/DEL.BLK N: block ops, " +
+			"REM delete file, MV dest move file.",
+		parameters: Type.Object({
+			input: Type.String({
+				description:
+					"Hashline patch: [PATH#TAG] section headers followed by " +
+					"SWAP/DEL/INS/REM/MV operations with + body rows. " +
+					"TAG must be the 4-hex snapshot tag from your latest read/grep/edit output.",
+			}),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const fs = new DiskFilesystem();
+			const patcher = new Patcher({ fs, snapshots, blockResolver });
+
+			// Parse the input into sections
+			let patch: Patch;
+			try {
+				patch = Patch.parse(params.input, { cwd: ctx.cwd });
+			} catch (e: any) {
+				return {
+					content: [{ type: "text", text: `Invalid hashline input: ${e.message}` }],
+					details: { error: e.message },
+				};
+			}
+
+			if (patch.sections.length === 0) {
+				return {
+					content: [{ type: "text", text: "No valid hashline sections found in input. Each section must start with [PATH#TAG]." }],
+					details: {},
+				};
+			}
+
+			// Apply all sections
+			try {
+				const result = await patcher.apply(patch);
+
+				// Check for no-ops
+				const noopSections = result.sections.filter(s => s.op === "noop");
+				if (noopSections.length === result.sections.length) {
+					// All no-ops — check loop guard
+					const firstPath = noopSections[0].canonicalPath;
+					const inputHash = computeFileHash(params.input);
+					const record = noopCounts.get(firstPath);
+					if (record && record.hash === inputHash) {
+						record.count++;
+						if (record.count >= NOOP_HARD_LIMIT) {
+							noopCounts.delete(firstPath);
+							return {
+								content: [{
+									type: "text",
+									text: `STOP. Edits to ${noopSections[0].path} have been a byte-identical no-op ${NOOP_HARD_LIMIT} times in a row. The file already contains your intended changes, or your anchor is wrong. Re-read the file before issuing another edit.`,
+								}],
+								details: {},
+							};
+						}
+					} else {
+						noopCounts.set(firstPath, { hash: inputHash, count: 1 });
+					}
+					return {
+						content: [{
+							type: "text",
+							text: `Edits to ${noopSections[0].path} produced no change — your body rows are byte-identical to the file. Re-read the file before issuing another edit. Do NOT widen the payload.`,
+						}],
+						details: {},
+					};
+				}
+
+				// Reset noop counts for paths that changed
+				for (const section of result.sections) {
+					if (section.op !== "noop") {
+						noopCounts.delete(section.canonicalPath);
+					}
+				}
+
+				// Build compact output
+				const parts: string[] = [];
+				for (const section of result.sections) {
+					if (section.op === "delete") {
+						parts.push(`Deleted ${section.path}`);
+						continue;
+					}
+					if (section.op === "noop") continue;
+
+					const preview = buildCompactDiffPreview(
+						// We need a diff string for preview
+						section.before === section.after ? "" : `${section.path}: changed`
+					);
+
+					const blockResolutions = section.blockResolutions
+						?.map(r => {
+							const op = r.op === "delete" ? "DEL.BLK" : r.op === "insert_after" ? "INS.BLK.POST" : "SWAP.BLK";
+							return `${op} ${r.anchorLine} → resolved lines ${r.start}-${r.end}`;
+						})
+						.join("\n") ?? "";
+
+					const warningsBlock = section.warnings.length > 0
+						? `\nWarnings:\n${section.warnings.join("\n")}`
+						: "";
+
+					const moveBlock = section.moveDest ? `\nMoved to ${section.moveDest}` : "";
+
+					parts.push(
+						`${section.header}${blockResolutions ? "\n" + blockResolutions : ""}${moveBlock}${warningsBlock}`
+					);
+				}
+
+				return {
+					content: [{ type: "text", text: parts.join("\n\n") || "No changes made." }],
+					details: result,
+				};
+			} catch (e: any) {
+				const message = e.message ?? String(e);
+				// Detect mismatch errors and provide helpful guidance
+				if (message.includes("hash") || message.includes("snapshot") || message.includes("tag")) {
+					return {
+						content: [{
+							type: "text",
+							text: `Edit failed — the file has changed since your last read:\n${message}\n\nRe-read the file to get fresh anchors, then re-issue your edit.`,
+						}],
+						details: { error: message },
+					};
+				}
+				return {
+					content: [{ type: "text", text: `Edit failed: ${message}` }],
+					details: { error: message },
+				};
+			}
+		},
+	});
+}
