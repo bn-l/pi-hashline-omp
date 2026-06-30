@@ -15,31 +15,30 @@ import { constants } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
-	computeFileHash,
 	formatHashlineHeader,
 	formatNumberedLines,
 	type InMemorySnapshotStore,
 } from "@oh-my-pi/hashline";
 
 // Image extensions that should fall through to pi's built-in image handling
-const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"]);
+const IMAGE_MIME: Record<string, string> = {
+	".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+	".png": "image/png",
+	".gif": "image/gif",
+	".webp": "image/webp",
+	".bmp": "image/bmp",
+	".svg": "image/svg+xml",
+};
 
-// Binary signatures to detect before reading full file
-function isImagePath(p: string): boolean {
+function detectImageMimeType(p: string): string | undefined {
 	const ext = p.split(".").pop()?.toLowerCase();
-	if (!ext) return false;
-	return IMAGE_EXTENSIONS.has(`.${ext}`);
+	if (!ext) return undefined;
+	return IMAGE_MIME[`.${ext}`];
 }
 
-function detectBinary(buffer: Buffer): boolean {
-	// Check first 512 bytes for null bytes (common heuristic)
-	const max = Math.min(buffer.length, 512);
-	for (let i = 0; i < max; i++) {
-		if (buffer[i] === 0) return true;
-	}
-	return false;
-}
-
+/** Pi's built-in read limits: 2000 lines, 64KB */
+const MAX_LINES = 2000;
+const MAX_BYTES = 64 * 1024;
 export function registerReadTool(pi: ExtensionAPI, snapshots: InMemorySnapshotStore) {
 	pi.registerTool({
 		name: "read",
@@ -55,11 +54,6 @@ export function registerReadTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const absolutePath = resolve(ctx.cwd, params.path);
 
-			// Images: fall through to pi's built-in read for attachment handling
-			if (isImagePath(absolutePath)) {
-				return { content: [{ type: "text", text: `[image detected — use pi's built-in read]` }], details: {} };
-			}
-
 			try {
 				await access(absolutePath, constants.R_OK);
 			} catch {
@@ -69,10 +63,28 @@ export function registerReadTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 				};
 			}
 
+			// Image handling: return as proper image attachment
+			const mimeType = detectImageMimeType(absolutePath);
+			if (mimeType) {
+				const buffer = await readFile(absolutePath);
+				return {
+					content: [
+						{ type: "text", text: `Read image file [${mimeType}]` },
+						{ type: "image" as any, data: buffer.toString("base64"), mimeType },
+					],
+					details: {},
+				};
+			}
+
 			const buffer = await readFile(absolutePath);
 
 			// Binary detection
-			if (detectBinary(buffer)) {
+			let isBinary = false;
+			const max = Math.min(buffer.length, 512);
+			for (let i = 0; i < max; i++) {
+				if (buffer[i] === 0) { isBinary = true; break; }
+			}
+			if (isBinary) {
 				return {
 					content: [{ type: "text", text: `Binary file: ${params.path} (use bash tools to inspect)` }],
 					details: {},
@@ -95,37 +107,59 @@ export function registerReadTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 				allLines.pop();
 			}
 
-			// Apply offset/limit
+			// Apply offset/limit — error on bad offset, don't clamp
 			const startLine = params.offset ?? 1;
-			const endLine = params.limit ? startLine + params.limit - 1 : allLines.length;
-			const clampedStart = Math.max(1, Math.min(startLine, allLines.length));
-			const clampedEnd = Math.max(clampedStart, Math.min(endLine, allLines.length));
-
-			if (clampedStart > allLines.length) {
+			if (startLine > allLines.length) {
 				return {
 					content: [{ type: "text", text: `Offset ${startLine} is beyond end of file (${allLines.length} lines)` }],
 					details: {},
 				};
 			}
+			if (startLine < 1) {
+				return {
+					content: [{ type: "text", text: `Offset ${startLine} is invalid (must be >= 1)` }],
+					details: {},
+				};
+			}
+			const maxEnd = Math.min(allLines.length, startLine + MAX_LINES - 1);
+			const endLine = params.limit ? Math.min(startLine + params.limit - 1, maxEnd) : maxEnd;
 
-			const sliced = allLines.slice(clampedStart - 1, clampedEnd);
+			const sliced = allLines.slice(startLine - 1, endLine);
+			let output = sliced.join("\n");
 
-			// Record snapshot for the full file (not just the slice)
-			const fileHash = snapshots.record(absolutePath, content);
+			// Byte truncation
+			let truncated = false;
+			if (Buffer.byteLength(output, "utf-8") > MAX_BYTES) {
+				let lo = 0, hi = sliced.length;
+				while (lo < hi) {
+					const mid = Math.floor((lo + hi) / 2);
+					if (Buffer.byteLength(sliced.slice(0, mid).join("\n"), "utf-8") <= MAX_BYTES) lo = mid + 1;
+					else hi = mid;
+				}
+				const keep = Math.max(1, lo - 1);
+				output = sliced.slice(0, keep).join("\n");
+				truncated = keep < sliced.length;
+			}
+
+			// Record snapshot with seenLines for protection
+			const seenLines = new Set<number>();
+			for (let i = startLine; i < startLine + output.split("\n").length; i++) seenLines.add(i);
+			const fileHash = snapshots.record(absolutePath, content, seenLines);
 
 			// Build output
 			const header = formatHashlineHeader(params.path, fileHash);
-			const body = formatNumberedLines(sliced.join("\n"), clampedStart);
+			const body = formatNumberedLines(output, startLine);
 
-			// Add elision markers if partial read
 			let prefix = "";
 			let suffix = "";
-			if (clampedStart > 1) prefix = `... (lines 1-${clampedStart - 1} elided)\n`;
-			if (clampedEnd < allLines.length) suffix = `\n... (lines ${clampedEnd + 1}-${allLines.length} elided)`;
+			if (startLine > 1) prefix = `... (lines 1-${startLine - 1} elided)\n`;
+			const lastShown = startLine + output.split("\n").length - 1;
+			if (lastShown < allLines.length) suffix = `\n... (lines ${lastShown + 1}-${allLines.length} elided)`;
+			if (truncated) suffix += `\n[Truncated to ${MAX_BYTES / 1024}KB — use offset/limit for remainder]`;
 
 			return {
 				content: [{ type: "text", text: `${prefix}${header}\n${body}${suffix}` }],
-				details: { path: params.path, fileHash, lines: allLines.length, shown: sliced.length },
+				details: { path: params.path, fileHash, lines: allLines.length, shown: Math.min(output.split("\n").length, endLine - startLine + 1), truncated },
 			};
 		},
 	});

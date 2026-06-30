@@ -17,23 +17,33 @@ import {
 	Patch,
 	buildCompactDiffPreview,
 	computeFileHash,
+	Filesystem,
 	type BlockResolver,
-	type Filesystem,
 	type InMemorySnapshotStore,
 	type WriteResult,
 } from "@oh-my-pi/hashline";
-import { readFile, writeFile, rename, unlink } from "node:fs/promises";
+import { readFile, writeFile, rename, unlink, access, constants } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as Diff from "diff";
 
 /**
- * Minimal Filesystem implementation backed by the real disk.
+ * Disk-backed Filesystem, cwd-aware.
+ * Extends the abstract Filesystem from @oh-my-pi/hashline.
  * Writes atomically via temp-file-then-rename.
+ * Serializes mutations per canonical path to prevent races.
  */
-class DiskFilesystem implements Filesystem {
+class DiskFilesystem extends Filesystem {
+	private cwd: string;
+	private static queues = new Map<string, Promise<void>>();
+
+	constructor(cwd: string) {
+		super();
+		this.cwd = cwd;
+	}
+
 	canonicalPath(p: string): string {
 		try {
-			return resolve(p);
+			return resolve(this.cwd, p);
 		} catch {
 			return p;
 		}
@@ -44,34 +54,62 @@ class DiskFilesystem implements Filesystem {
 	}
 
 	async writeText(p: string, content: string): Promise<WriteResult> {
-		// Atomic write via temp file
-		const dir = dirname(p);
-		const tmp = `${dir}/.pi-hashline-${randomUUID()}.tmp`;
-		try {
-			await writeFile(tmp, content, "utf-8");
-			await rename(tmp, p);
-		} catch (e) {
-			try { await unlink(tmp); } catch {}
-			throw e;
-		}
-		return { text: content };
+		// Atomic write via temp file, serialized per path
+		const op = async (): Promise<WriteResult> => {
+			const dir = dirname(p);
+			const tmp = `${dir}/.pi-hashline-${randomUUID()}.tmp`;
+			try {
+				await writeFile(tmp, content, "utf-8");
+				await rename(tmp, p);
+			} catch (e) {
+				try { await unlink(tmp); } catch {}
+				throw e;
+			}
+			return { text: content };
+		};
+		return this.enqueue(p, op);
 	}
 
 	async delete(p: string): Promise<void> {
-		await unlink(p);
+		await this.enqueue(p, async () => { await unlink(p); });
 	}
 
 	async move(source: string, dest: string, content: string): Promise<void> {
-		await writeFile(dest, content, "utf-8");
-		await unlink(source);
+		await this.enqueue(source, async () => {
+			await writeFile(dest, content, "utf-8");
+			await unlink(source);
+		});
 	}
 
-	async preflightWrite(_path: string, _options?: { fileOp?: { kind: string } }): Promise<void> {
-		// No permission checks for now
+	async exists(p: string): Promise<boolean> {
+		try {
+			await access(p, constants.R_OK);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
-	allowTagPathRecovery(_authoredPath: string, _recoveredPath: string): boolean {
-		return true;
+	async preflightWrite(path: string, _options?: { fileOp?: { kind: string } }): Promise<void> {
+		// Verify path is within the workspace cwd
+		const canonical = this.canonicalPath(path);
+		if (!canonical.startsWith(resolve(this.cwd))) {
+			throw new Error(`Write denied: ${path} is outside the workspace`);
+		}
+	}
+
+	allowTagPathRecovery(_authoredPath: string, resolvedPath: string): boolean {
+		// Only allow recovery to paths within the workspace
+		return resolvedPath.startsWith(resolve(this.cwd));
+	}
+
+	/** Serialize mutations to the same canonical path. */
+	private enqueue<T>(path: string, fn: () => Promise<T>): Promise<T> {
+		const canonical = this.canonicalPath(path);
+		const prev = DiskFilesystem.queues.get(canonical) ?? Promise.resolve();
+		const next = prev.then(fn, fn); // run even if previous rejected
+		DiskFilesystem.queues.set(canonical, next.then(() => {}, () => {}));
+		return next;
 	}
 }
 
@@ -138,7 +176,7 @@ export function registerEditTool(
 			}),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const fs = new DiskFilesystem();
+			const fs = new DiskFilesystem(ctx.cwd);
 			const patcher = new Patcher({ fs, snapshots, blockResolver });
 
 			// Parse the input into sections

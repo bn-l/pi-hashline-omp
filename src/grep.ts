@@ -13,11 +13,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolve } from "node:path";
 import { readFile } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import {
-	computeFileHash,
 	formatHashlineHeader,
-	formatNumberedLines,
 	type InMemorySnapshotStore,
 } from "@oh-my-pi/hashline";
 
@@ -36,67 +34,70 @@ export function registerGrepTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 			maxResults: Type.Optional(Type.Number({ description: "Maximum results to return (default: 50)" })),
 			caseSensitive: Type.Optional(Type.Boolean({ description: "Case-sensitive search (default: smart-case)" })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const searchPath = params.path ? resolve(ctx.cwd, params.path) : ctx.cwd;
 			const maxResults = params.maxResults ?? 50;
 
-			// Build ripgrep args
-			const args: string[] = ["--line-number", "--no-heading", "--with-filename", "--color=never"];
+			// Build ripgrep args — use --json for robust parsing
+			const args: string[] = ["--json", "--no-heading", "--with-filename", "--color=never"];
 			if (params.glob) args.push("--glob", params.glob);
 			if (params.caseSensitive === true) args.push("--case-sensitive");
 			else if (params.caseSensitive === false) args.push("--ignore-case");
 			args.push("--max-count", String(Math.min(maxResults, 200)));
-			// Escape single quotes in pattern for shell
-			const safePattern = params.pattern.replace(/'/g, "'\\''");
-			args.push(safePattern);
-			args.push(searchPath);
+			// Use -e for pattern to protect dash-prefixed patterns
+			args.push("-e", params.pattern);
+			// -- separates options from paths
+			args.push("--", searchPath);
 
-			let output: string;
+			let rawOutput: string;
 			try {
-				const result = spawnSync('rg', args, { timeout: 30000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
-				if (result.error) {
-					return {
-						content: [{ type: "text", text: `rg failed: ${result.error.message}` }],
-						details: { error: result.error.message },
-					};
-				}
-				if (result.status === 2) {
-					return {
-						content: [{ type: "text", text: `rg error: ${result.stderr || 'unknown error'}` }],
-						details: { error: result.stderr || 'ripgrep error' },
-					};
-				}
-				output = result.stdout || '';
+				rawOutput = await new Promise<string>((resolve, reject) => {
+					const child = execFile('rg', args, { timeout: 30000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+						if (err) {
+							if (err.killed) { resolve(stdout || ''); return; }
+							// rg exits 1 = no matches, 2 = error
+							if ((err as any).code === 1) { resolve(stdout || ''); return; }
+							reject(new Error(stderr || err.message));
+							return;
+						}
+						resolve(stdout);
+					});
+					if (signal) {
+						signal.addEventListener('abort', () => child.kill(), { once: true });
+					}
+				});
 			} catch (e: any) {
 				return {
-					content: [{ type: "text", text: `rg spawn failed: ${e.message}` }],
+					content: [{ type: "text", text: `rg failed: ${e.message}` }],
 					details: { error: e.message },
 				};
 			}
 
-			if (!output.trim()) {
+			if (!rawOutput.trim()) {
 				return {
 					content: [{ type: "text", text: `No matches found for: ${params.pattern}` }],
 					details: { matches: 0 },
 				};
 			}
 
-			// Parse ripgrep output: "path:line:text"
-			const lines = output.trim().split("\n").slice(0, maxResults);
+			// Parse rg --json output: one JSON object per line
+			const jsonLines = rawOutput.trim().split("\n");
 			const fileMatches = new Map<string, number[]>(); // path → [lineNumbers]
+			let matchCount = 0;
 
-			for (const line of lines) {
-				const colonIdx = line.indexOf(":");
-				if (colonIdx < 0) continue;
-				const secondColonIdx = line.indexOf(":", colonIdx + 1);
-				if (secondColonIdx < 0) continue;
-
-				const filePath = line.substring(0, colonIdx);
-				const lineNum = parseInt(line.substring(colonIdx + 1, secondColonIdx), 10);
-				if (isNaN(lineNum)) continue;
-
-				if (!fileMatches.has(filePath)) fileMatches.set(filePath, []);
-				fileMatches.get(filePath)!.push(lineNum);
+			for (const line of jsonLines) {
+				if (matchCount >= maxResults) break;
+				try {
+					const obj = JSON.parse(line);
+					if (obj.type !== "match") continue;
+					const d = obj.data;
+					const filePath = d.path?.text;
+					const lineNum = d.line_number;
+					if (!filePath || typeof lineNum !== "number") continue;
+					if (!fileMatches.has(filePath)) fileMatches.set(filePath, []);
+					fileMatches.get(filePath)!.push(lineNum);
+					matchCount++;
+				} catch { continue; }
 			}
 
 			// Build hashline output per file
@@ -109,17 +110,18 @@ export function registerGrepTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 					continue;
 				}
 
-				const fileHash = snapshots.record(filePath, content);
 				const allLines = content.split("\n");
 
 				// Collect matching lines with context
 				const shown = new Set<number>();
 				for (const ml of matchLines) {
-					// Show the matching line ±1 context
 					for (let i = Math.max(1, ml - 1); i <= Math.min(allLines.length, ml + 1); i++) {
 						shown.add(i);
 					}
 				}
+
+				// Record snapshot with seenLines for edit protection
+				const fileHash = snapshots.record(filePath, content, shown);
 
 				const sortedShown = [...shown].sort((a, b) => a - b);
 
@@ -147,7 +149,7 @@ export function registerGrepTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 
 			return {
 				content: [{ type: "text", text: parts.join("\n\n") }],
-				details: { matches: lines.length, files: fileMatches.size },
+				details: { matches: matchCount, files: fileMatches.size },
 			};
 		},
 	});

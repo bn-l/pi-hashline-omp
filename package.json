@@ -27,13 +27,14 @@
     "extensions": ["./index.ts"]
   },
   "dependencies": {
-    "@oh-my-pi/hashline": "^16.2.5"
+    "@oh-my-pi/hashline": "^16.2.5",
+    "diff": "^9.0.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "typebox": "*"
   },
   "scripts": {
     "test": "bun test"

@@ -40,6 +40,37 @@ function classify(path: string): string | null {
 	return null;
 }
 
+/** Strip string literals and comments from a line before brace counting. */
+function stripStringsAndComments(line: string): string {
+	let result = "";
+	let i = 0;
+	while (i < line.length) {
+		// Single-line comment
+		if (line[i] === '/' && line[i + 1] === '/') break;
+		// Block comment start
+		if (line[i] === '/' && line[i + 1] === '*') {
+			i += 2;
+			while (i < line.length - 1 && !(line[i] === '*' && line[i + 1] === '/')) i++;
+			i += 2;
+			continue;
+		}
+		// String literals (single, double, template)
+		if (line[i] === '"' || line[i] === "'" || line[i] === '`') {
+			const quote = line[i];
+			i++;
+			while (i < line.length) {
+				if (line[i] === '\\') { i += 2; continue; }
+				if (line[i] === quote) { i++; break; }
+				i++;
+			}
+			continue;
+		}
+		result += line[i];
+		i++;
+	}
+	return result;
+}
+
 /** Find the matching closing brace line for brace-languages. */
 function resolveBraceBlock(text: string, line: number): BlockSpan | null {
 	const lines = text.split("\n");
@@ -51,8 +82,8 @@ function resolveBraceBlock(text: string, line: number): BlockSpan | null {
 	let foundOpen = false;
 	let start = idx;
 	for (let i = idx; i < lines.length; i++) {
-		const stripped = lines[i];
-		for (const ch of stripped) {
+		const cleaned = stripStringsAndComments(lines[i]);
+		for (const ch of cleaned) {
 			if (ch === "{") {
 				if (!foundOpen) {
 					foundOpen = true;
@@ -61,7 +92,6 @@ function resolveBraceBlock(text: string, line: number): BlockSpan | null {
 				depth++;
 			} else if (ch === "}") {
 				if (!foundOpen) {
-					// No opener on or before this line — can't resolve
 					return null;
 				}
 				depth--;
@@ -71,7 +101,7 @@ function resolveBraceBlock(text: string, line: number): BlockSpan | null {
 			}
 		}
 	}
-	return null; // Unbalanced braces
+	return null;
 }
 
 /** Find the matching indentation block for Python. */
