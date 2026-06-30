@@ -20,6 +20,7 @@ import {
 	MismatchError,
 } from "@oh-my-pi/hashline";
 import { createBlockResolver } from "../src/block-resolver";
+import { xxHash32 } from "../src/hash-polyfill";
 import { createSnapshotStore } from "../src/snapshot-store";
 
 // ---------- Block Resolver Tests ----------
@@ -58,14 +59,36 @@ describe("block resolver", () => {
 			expect(result!.end).toBe(3);
 		});
 
-		it("resolves block in Rust", () => {
-			const code = "struct A;\nstruct B {\n    x: u32,\n}\n";
-			const result = resolver({ path: "test.rs", text: code, line: 2 });
-			expect(result).not.toBeNull();
-			expect(result!.start).toBe(2);
-			expect(result!.end).toBe(4);
+			it("resolves block in Rust", () => {
+				const code = "struct A;\nstruct B {\n    x: u32,\n}\n";
+				const result = resolver({ path: "test.rs", text: code, line: 2 });
+				expect(result).not.toBeNull();
+				expect(result!.start).toBe(2);
+				expect(result!.end).toBe(4);
+			});
+
+			it("does not treat braces inside regex literals as blocks", () => {
+				const code = "const re = /foo{2}/g;\nconst x = 1;\n";
+				const result = resolver({ path: "test.ts", text: code, line: 1 });
+				expect(result).toBeNull();
+			});
+
+			it("ignores braces inside escaped strings", () => {
+				const code = "function f() {\n  const s = \"escaped \\\" { not a block\";\n  return 1;\n}\n";
+				const result = resolver({ path: "test.ts", text: code, line: 1 });
+				expect(result).not.toBeNull();
+				expect(result!.start).toBe(1);
+				expect(result!.end).toBe(4);
+			});
+
+			it("ignores braces inside multi-line template literals", () => {
+				const code = "function f() {\n  const s = `{\n    still template\n  }`;\n  return 1;\n}\n";
+				const result = resolver({ path: "test.ts", text: code, line: 1 });
+				expect(result).not.toBeNull();
+				expect(result!.start).toBe(1);
+				expect(result!.end).toBe(6);
+			});
 		});
-	});
 
 	describe("python", () => {
 		it("resolves function block", () => {
@@ -82,24 +105,40 @@ describe("block resolver", () => {
 			expect(result).toBeNull();
 		});
 
-		it("resolves nested blocks (inner for)", () => {
-			const code = "def f(xs):\n    total = 0\n    for x in xs:\n        total += x\n    return total\n";
-			const result = resolver({ path: "test.py", text: code, line: 3 });
-			expect(result).not.toBeNull();
-			expect(result!.start).toBe(3);
-			expect(result!.end).toBe(4);
+			it("resolves nested blocks (inner for)", () => {
+				const code = "def f(xs):\n    total = 0\n    for x in xs:\n        total += x\n    return total\n";
+				const result = resolver({ path: "test.py", text: code, line: 3 });
+				expect(result).not.toBeNull();
+				expect(result!.start).toBe(3);
+				expect(result!.end).toBe(4);
+			});
+
+			it("includes decorators in decorated function blocks", () => {
+				const code = "@decorator\n@other\ndef f():\n    return 1\n\nx = 2\n";
+				const result = resolver({ path: "test.py", text: code, line: 1 });
+				expect(result).not.toBeNull();
+				expect(result!.start).toBe(1);
+				expect(result!.end).toBe(4);
+			});
 		});
-	});
 
 	describe("shell", () => {
-		it("resolves if/fi block", () => {
-			const code = "if [[ -f file ]]; then\n  echo ok\nfi\n";
-			const result = resolver({ path: "test.sh", text: code, line: 1 });
-			expect(result).not.toBeNull();
-			expect(result!.start).toBe(1);
-			expect(result!.end).toBe(3);
+			it("resolves if/fi block", () => {
+				const code = "if [[ -f file ]]; then\n  echo ok\nfi\n";
+				const result = resolver({ path: "test.sh", text: code, line: 1 });
+				expect(result).not.toBeNull();
+				expect(result!.start).toBe(1);
+				expect(result!.end).toBe(3);
+			});
+
+			it("resolves nested if/fi blocks", () => {
+				const code = "if outer; then\n  if inner; then\n    echo ok\n  fi\nfi\n";
+				const result = resolver({ path: "test.sh", text: code, line: 1 });
+				expect(result).not.toBeNull();
+				expect(result!.start).toBe(1);
+				expect(result!.end).toBe(5);
+			});
 		});
-	});
 
 	describe("markdown", () => {
 		it("resolves heading section", () => {
@@ -271,9 +310,17 @@ describe("hashline engine", () => {
 
 // ---------- Format Tests ----------
 
-describe("format", () => {
-	it("computeFileHash is deterministic", () => {
-		const h1 = computeFileHash("hello\n");
+	describe("format", () => {
+		it("xxHash32 polyfill matches Bun vectors", () => {
+			expect(xxHash32("", 0).toString(16).padStart(8, "0")).toBe("02cc5d05");
+			expect(xxHash32("a", 0).toString(16).padStart(8, "0")).toBe("550d7456");
+			expect(xxHash32("abc", 0).toString(16).padStart(8, "0")).toBe("32d153ff");
+			expect(xxHash32("hello", 0).toString(16).padStart(8, "0")).toBe("fb0077f9");
+			expect(xxHash32("π", 0).toString(16).padStart(8, "0")).toBe("b0b85fdb");
+		});
+
+		it("computeFileHash is deterministic", () => {
+			const h1 = computeFileHash("hello\n");
 		const h2 = computeFileHash("hello\n");
 		expect(h1).toBe(h2);
 		expect(h1).toMatch(/^[0-9A-F]{4}$/);

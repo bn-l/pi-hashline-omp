@@ -40,22 +40,90 @@ function classify(path: string): string | null {
 	return null;
 }
 
+interface StripState {
+	blockComment: boolean;
+	template: boolean;
+}
+
+function canStartRegexLiteral(output: string): boolean {
+	const trimmed = output.trimEnd();
+	if (trimmed === "") return true;
+	if (/\b(?:return|throw|case|delete|void|typeof|yield|await)$/.test(trimmed)) return true;
+	const last = trimmed[trimmed.length - 1]!;
+	return "([{=,:;!&|?+-*%^~<>".includes(last);
+}
+
+function skipRegexLiteral(line: string, start: number): number {
+	let i = start + 1;
+	let inClass = false;
+	while (i < line.length) {
+		if (line[i] === "\\") {
+			i += 2;
+			continue;
+		}
+		if (line[i] === "[" && !inClass) {
+			inClass = true;
+			i++;
+			continue;
+		}
+		if (line[i] === "]" && inClass) {
+			inClass = false;
+			i++;
+			continue;
+		}
+		if (line[i] === "/" && !inClass) {
+			i++;
+			while (/[A-Za-z]/.test(line[i] ?? "")) i++;
+			return i;
+		}
+		i++;
+	}
+	return i;
+}
+
 /** Strip string literals and comments from a line before brace counting. */
-function stripStringsAndComments(line: string): string {
+function stripStringsAndComments(line: string, state: StripState): string {
 	let result = "";
 	let i = 0;
 	while (i < line.length) {
+		if (state.blockComment) {
+			const end = line.indexOf("*/", i);
+			if (end === -1) return result;
+			state.blockComment = false;
+			i = end + 2;
+			continue;
+		}
+		if (state.template) {
+			if (line[i] === "\\") { i += 2; continue; }
+			if (line[i] === "`") {
+				state.template = false;
+				i++;
+				continue;
+			}
+			i++;
+			continue;
+		}
 		// Single-line comment
 		if (line[i] === '/' && line[i + 1] === '/') break;
 		// Block comment start
 		if (line[i] === '/' && line[i + 1] === '*') {
-			i += 2;
-			while (i < line.length - 1 && !(line[i] === '*' && line[i + 1] === '/')) i++;
+			state.blockComment = true;
 			i += 2;
 			continue;
 		}
-		// String literals (single, double, template)
-		if (line[i] === '"' || line[i] === "'" || line[i] === '`') {
+		// Regex literals
+		if (line[i] === "/" && canStartRegexLiteral(result)) {
+			i = skipRegexLiteral(line, i);
+			continue;
+		}
+		// Template literals
+		if (line[i] === "`") {
+			state.template = true;
+			i++;
+			continue;
+		}
+		// String literals
+		if (line[i] === '"' || line[i] === "'") {
 			const quote = line[i];
 			i++;
 			while (i < line.length) {
@@ -81,8 +149,9 @@ function resolveBraceBlock(text: string, line: number): BlockSpan | null {
 	let depth = 0;
 	let foundOpen = false;
 	let start = idx;
+	const state: StripState = { blockComment: false, template: false };
 	for (let i = idx; i < lines.length; i++) {
-		const cleaned = stripStringsAndComments(lines[i]!);
+		const cleaned = stripStringsAndComments(lines[i]!, state);
 		for (const ch of cleaned) {
 			if (ch === "{") {
 				if (!foundOpen) {
@@ -118,6 +187,15 @@ function resolvePythonBlock(text: string, line: number): BlockSpan | null {
 	const isColonHeader = headerLine.trimEnd().endsWith(":");
 	const isDecorator = headerLine.trimStart().startsWith("@");
 	if (!isColonHeader && !isDecorator) return null;
+	if (isDecorator) {
+		let decoratedIdx = idx + 1;
+		while (decoratedIdx < lines.length && (lines[decoratedIdx]!.trim() === "" || lines[decoratedIdx]!.trimStart().startsWith("@") || lines[decoratedIdx]!.trimStart().startsWith("#"))) {
+			decoratedIdx++;
+		}
+		if (decoratedIdx >= lines.length || !lines[decoratedIdx]!.trimEnd().endsWith(":")) return null;
+		const decorated = resolvePythonBlock(text, decoratedIdx + 1);
+		return decorated ? { start: line, end: decorated.end } : null;
+	}
 
 	// Determine the indentation level of the first body line
 	const headerIndent = headerLine.length - headerLine.trimStart().length;
@@ -188,6 +266,10 @@ function resolveShellBlock(text: string, line: number): BlockSpan | null {
 	let depth = 1;
 	for (let i = idx + 1; i < lines.length; i++) {
 		const firstWord = lines[i]!.trimStart().split(/\s/)[0]!;
+		if (openers[firstWord] === closer) {
+			depth++;
+			continue;
+		}
 		if (firstWord === closer) {
 			depth--;
 			if (depth === 0) return { start: line, end: i + 1 };

@@ -11,7 +11,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { resolve, dirname } from "node:path";
+import { dirname } from "node:path";
 import {
 	Patcher,
 	Patch,
@@ -19,12 +19,14 @@ import {
 	computeFileHash,
 	Filesystem,
 	type BlockResolver,
+	type FileOp,
 	type InMemorySnapshotStore,
 	type WriteResult,
 } from "@oh-my-pi/hashline";
 import { readFile, writeFile, rename, unlink, access, constants } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as Diff from "diff";
+import { canonicalPath as resolveCanonicalPath, isPathInside, workspaceRoot } from "./paths";
 
 /**
  * Disk-backed Filesystem, cwd-aware.
@@ -33,40 +35,34 @@ import * as Diff from "diff";
  * Serializes mutations per canonical path to prevent races.
  */
 class DiskFilesystem extends Filesystem {
-	private cwd: string;
+	private readonly cwd: string;
+	private readonly root: string;
 	private static queues = new Map<string, Promise<void>>();
 
 	constructor(cwd: string) {
 		super();
 		this.cwd = cwd;
+		this.root = workspaceRoot(cwd);
 	}
 
 	canonicalPath(p: string): string {
-		try {
-			return resolve(this.cwd, p);
-		} catch (e) {
-			console.error("pi-hashline-omp: canonicalPath resolve error:", e);
-			return p;
-		}
+		return resolveCanonicalPath(this.cwd, p);
 	}
 
 	async readText(p: string): Promise<string> {
-		return readFile(this.canonicalPath(p), "utf-8");
+		const cp = this.canonicalPath(p);
+		try {
+			return await readFile(cp, "utf-8");
+		} catch (e) {
+			console.error(`pi-hashline-omp: readText failed for ${cp}:`, e);
+			throw e;
+		}
 	}
 
 	async writeText(p: string, content: string): Promise<WriteResult> {
 		const cp = this.canonicalPath(p);
 		const op = async (): Promise<WriteResult> => {
-			const dir = dirname(cp);
-			const tmp = `${dir}/.pi-hashline-${randomUUID()}.tmp`;
-			try {
-				await writeFile(tmp, content, "utf-8");
-				await rename(tmp, cp);
-			} catch (e) {
-				console.error("pi-hashline-omp: writeText atomic error:", e);
-				try { await unlink(tmp); } catch (e) { console.error("pi-hashline-omp: unlink temp error:", e); }
-				throw e;
-			}
+			await this.writeAtomically(cp, content);
 			return { text: content };
 		};
 		return this.enqueue(cp, op);
@@ -74,49 +70,94 @@ class DiskFilesystem extends Filesystem {
 
 	async delete(p: string): Promise<void> {
 		const cp = this.canonicalPath(p);
-		await this.enqueue(cp, async () => { await unlink(cp); });
+		await this.enqueue(cp, async () => {
+			try {
+				await unlink(cp);
+			} catch (e) {
+				console.error(`pi-hashline-omp: delete failed for ${cp}:`, e);
+				throw e;
+			}
+		});
 	}
 
-	async move(source: string, dest: string, content: string): Promise<void> {
+	async move(source: string, dest: string, content?: string): Promise<void> {
 		const cs = this.canonicalPath(source);
 		const cd = this.canonicalPath(dest);
-		await this.enqueue(cs, async () => {
-			await writeFile(cd, content, "utf-8");
-			await unlink(cs);
+		await this.enqueue([cs, cd], async () => {
+			try {
+				if (content === undefined) {
+					await rename(cs, cd);
+				} else {
+					await this.writeAtomically(cd, content);
+					await unlink(cs);
+				}
+			} catch (e) {
+				console.error(`pi-hashline-omp: move failed for ${cs} -> ${cd}:`, e);
+				throw e;
+			}
 		});
 	}
 
 	async exists(p: string): Promise<boolean> {
+		const cp = this.canonicalPath(p);
 		try {
-			await access(this.canonicalPath(p), constants.R_OK);
+			await access(cp, constants.R_OK);
 			return true;
-		} catch {
+		} catch (e) {
+			console.error(`pi-hashline-omp: exists check failed for ${cp}:`, e);
 			return false;
 		}
 	}
 
-
-
-	async preflightWrite(path: string, _options?: { fileOp?: { kind: string } }): Promise<void> {
-		// Verify path is within the workspace cwd
+	async preflightWrite(path: string, options?: { fileOp?: FileOp }): Promise<void> {
 		const canonical = this.canonicalPath(path);
-		if (!canonical.startsWith(resolve(this.cwd))) {
-			throw new Error(`Write denied: ${path} is outside the workspace`);
+		this.assertInsideWorkspace(path, canonical, "Write denied");
+		if (options?.fileOp?.kind === "move") {
+			const destCanonical = this.canonicalPath(options.fileOp.dest);
+			this.assertInsideWorkspace(options.fileOp.dest, destCanonical, "Move denied");
 		}
 	}
 
 	allowTagPathRecovery(_authoredPath: string, resolvedPath: string): boolean {
-		// Only allow recovery to paths within the workspace
-		return resolvedPath.startsWith(resolve(this.cwd));
+		return isPathInside(this.root, this.canonicalPath(resolvedPath));
 	}
 
 	/** Serialize mutations to the same canonical path. */
-	private enqueue<T>(path: string, fn: () => Promise<T>): Promise<T> {
-		const canonical = this.canonicalPath(path);
-		const prev = DiskFilesystem.queues.get(canonical) ?? Promise.resolve();
-		const next = prev.then(fn, fn); // run even if previous rejected
-		DiskFilesystem.queues.set(canonical, next.then(() => {}, () => {}));
+	private enqueue<T>(paths: string | string[], fn: () => Promise<T>): Promise<T> {
+		const canonicalPaths = [...new Set((Array.isArray(paths) ? paths : [paths]).map(p => this.canonicalPath(p)))].sort();
+		const previous = Promise.all(canonicalPaths.map(path => DiskFilesystem.queues.get(path) ?? Promise.resolve()));
+		const next = previous.then(fn);
+		const tail = next.then(() => {}, () => {});
+		for (const path of canonicalPaths) DiskFilesystem.queues.set(path, tail);
+		void tail.then(() => {
+			for (const path of canonicalPaths) {
+				if (DiskFilesystem.queues.get(path) === tail) DiskFilesystem.queues.delete(path);
+			}
+		});
 		return next;
+	}
+
+	private assertInsideWorkspace(authoredPath: string, canonical: string, action: string): void {
+		if (!isPathInside(this.root, canonical)) {
+			throw new Error(`${action}: ${authoredPath} is outside the workspace`);
+		}
+	}
+
+	private async writeAtomically(path: string, content: string): Promise<void> {
+		const dir = dirname(path);
+		const tmp = `${dir}/.pi-hashline-${randomUUID()}.tmp`;
+		try {
+			await writeFile(tmp, content, "utf-8");
+			await rename(tmp, path);
+		} catch (e) {
+			console.error(`pi-hashline-omp: atomic write failed for ${path}:`, e);
+			try {
+				await unlink(tmp);
+			} catch (cleanupError) {
+				console.error(`pi-hashline-omp: temp cleanup failed for ${tmp}:`, cleanupError);
+			}
+			throw e;
+		}
 	}
 }
 
@@ -158,6 +199,31 @@ function toDisplayDiff(before: string, after: string): string {
 
 let noopCounts = new Map<string, { hash: string; count: number }>();
 const NOOP_HARD_LIMIT = 3;
+const mutationQueues = new Map<string, Promise<void>>();
+
+function enqueueMutation<T>(paths: string[], fn: () => Promise<T>): Promise<T> {
+	const canonicalPaths = [...new Set(paths)].sort();
+	const previous = Promise.all(canonicalPaths.map(path => mutationQueues.get(path) ?? Promise.resolve()));
+	const next = previous.then(fn);
+	const tail = next.then(() => {}, () => {});
+	for (const path of canonicalPaths) mutationQueues.set(path, tail);
+	void tail.then(() => {
+		for (const path of canonicalPaths) {
+			if (mutationQueues.get(path) === tail) mutationQueues.delete(path);
+		}
+	});
+	return next;
+}
+
+function collectMutationPaths(fs: DiskFilesystem, patch: Patch): string[] {
+	const paths: string[] = [];
+	for (const section of patch.sections) {
+		paths.push(fs.canonicalPath(section.path));
+		const fileOp = section.parse().fileOp;
+		if (fileOp?.kind === "move") paths.push(fs.canonicalPath(fileOp.dest));
+	}
+	return paths;
+}
 
 export function registerEditTool(
 	pi: ExtensionAPI,
@@ -191,6 +257,7 @@ export function registerEditTool(
 			try {
 				patch = Patch.parse(params.input, { cwd: ctx.cwd });
 			} catch (e: any) {
+				console.error("pi-hashline-omp: invalid hashline input:", e);
 				return {
 					content: [{ type: "text", text: `Invalid hashline input: ${e.message}` }],
 					details: { error: e.message },
@@ -206,7 +273,7 @@ export function registerEditTool(
 
 			// Apply all sections
 			try {
-				const result = await patcher.apply(patch);
+				const result = await enqueueMutation(collectMutationPaths(fs, patch), () => patcher.apply(patch));
 
 				// Check for no-ops
 				const noopSections = result.sections.filter(s => s.op === "noop");
@@ -298,6 +365,7 @@ export function registerEditTool(
 				};
 			} catch (e: any) {
 				const message = e.message ?? String(e);
+				console.error("pi-hashline-omp: edit failed:", e);
 				// Detect mismatch errors and provide helpful guidance
 				if (message.includes("hash") || message.includes("snapshot") || message.includes("tag")) {
 					return {
