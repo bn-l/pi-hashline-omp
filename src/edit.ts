@@ -44,7 +44,8 @@ class DiskFilesystem extends Filesystem {
 	canonicalPath(p: string): string {
 		try {
 			return resolve(this.cwd, p);
-		} catch {
+		} catch (e) {
+			console.error("pi-hashline-omp: canonicalPath resolve error:", e);
 			return p;
 		}
 	}
@@ -62,7 +63,7 @@ class DiskFilesystem extends Filesystem {
 				await writeFile(tmp, content, "utf-8");
 				await rename(tmp, cp);
 			} catch (e) {
-				try { await unlink(tmp); } catch {}
+				try { await unlink(tmp); } catch (e) { console.error("pi-hashline-omp: unlink temp error:", e); }
 				throw e;
 			}
 			return { text: content };

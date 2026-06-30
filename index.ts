@@ -45,9 +45,14 @@ export default function (pi: ExtensionAPI) {
 	const snapshots = createSnapshotStore();
 	const blockResolver = createBlockResolver();
 
-	registerReadTool(pi, snapshots);
-	registerEditTool(pi, snapshots, blockResolver);
-	registerGrepTool(pi, snapshots);
+	try {
+		registerReadTool(pi, snapshots);
+		registerEditTool(pi, snapshots, blockResolver);
+		registerGrepTool(pi, snapshots);
+	} catch (e) {
+		console.error("pi-hashline-omp: registration failed:", e);
+		throw e;
+	}
 
 	// Inject the hashline patch language instructions into the system prompt
 	pi.on("before_agent_start", async (event, _ctx) => {

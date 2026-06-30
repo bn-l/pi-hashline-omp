@@ -97,7 +97,7 @@ export function registerGrepTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 					if (!fileMatches.has(filePath)) fileMatches.set(filePath, []);
 					fileMatches.get(filePath)!.push(lineNum);
 					matchCount++;
-				} catch { continue; }
+				} catch (e) { console.error("pi-hashline-omp: grep JSON parse error:", e); continue; }
 			}
 
 			// Build hashline output per file
@@ -106,7 +106,8 @@ export function registerGrepTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 				let content: string;
 				try {
 					content = await readFile(resolve(ctx.cwd, filePath), "utf-8");
-				} catch {
+				} catch (e) {
+					console.error("pi-hashline-omp: grep read error:", e);
 					continue;
 				}
 
