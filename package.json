@@ -4,7 +4,7 @@
   "description": "Full oh-my-pi hashline editing for pi coding agent — hash-anchored reads, text-DSL edits, tree-sitter block ops, and grep integration",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bml/pi-hashline-omp.git"
+    "url": "git+https://github.com/bn-l/pi-hashline-omp.git"
   },
   "author": "bml",
   "keywords": [
