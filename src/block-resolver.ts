@@ -82,7 +82,7 @@ function resolveBraceBlock(text: string, line: number): BlockSpan | null {
 	let foundOpen = false;
 	let start = idx;
 	for (let i = idx; i < lines.length; i++) {
-		const cleaned = stripStringsAndComments(lines[i]);
+		const cleaned = stripStringsAndComments(lines[i]!);
 		for (const ch of cleaned) {
 			if (ch === "{") {
 				if (!foundOpen) {
@@ -110,8 +110,8 @@ function resolvePythonBlock(text: string, line: number): BlockSpan | null {
 	const idx = line - 1;
 	if (idx < 0 || idx >= lines.length) return null;
 
-	const headerLine = lines[idx];
-	if (headerLine.trim() === "") return null; // Blank line
+	const headerLine = lines[idx]!;
+	if (headerLine.trim() === "") return null;
 
 	// Only resolve if the line ends with ':' (def, class, if, for, while, etc.)
 	// or starts with a decorator (@)
@@ -123,31 +123,26 @@ function resolvePythonBlock(text: string, line: number): BlockSpan | null {
 	const headerIndent = headerLine.length - headerLine.trimStart().length;
 	// Find the first non-blank, non-comment line after the header
 	let bodyIdx = idx + 1;
-	while (bodyIdx < lines.length && (lines[bodyIdx].trim() === "" || lines[bodyIdx].trimStart().startsWith("#"))) {
+	while (bodyIdx < lines.length && (lines[bodyIdx]!.trim() === "" || lines[bodyIdx]!.trimStart().startsWith("#"))) {
 		bodyIdx++;
 	}
 	if (bodyIdx >= lines.length) {
-		// Empty body — single-line block
 		return { start: line, end: line };
 	}
 
-	const bodyLine = lines[bodyIdx];
+	const bodyLine = lines[bodyIdx]!;
 	const bodyIndent = bodyLine.length - bodyLine.trimStart().length;
 
-	// If body isn't indented more than header, it's not a block
 	if (bodyIndent <= headerIndent) return null;
 
-	// Find the last line at >= bodyIndent (exclude trailing blank-only lines)
 	let endIdx = bodyIdx;
 	for (let i = bodyIdx + 1; i < lines.length; i++) {
-		const trimmed = lines[i].trim();
+		const trimmed = lines[i]!.trim();
 		if (trimmed === "" || trimmed.startsWith("#")) {
-			// Blank/comment lines don't end the block, but only if there's
-			// subsequent indented content — otherwise don't extend past last real content
 			endIdx = i;
 			continue;
 		}
-		const lineIndent = lines[i].length - lines[i].trimStart().length;
+		const lineIndent = lines[i]!.length - lines[i]!.trimStart().length;
 		if (lineIndent >= bodyIndent) {
 			endIdx = i;
 		} else {
@@ -155,9 +150,7 @@ function resolvePythonBlock(text: string, line: number): BlockSpan | null {
 		}
 	}
 
-	// Don't extend past the last non-empty line (trailing blank lines from
-	// trailing newline aren't part of the block)
-	while (endIdx > bodyIdx && lines[endIdx].trim() === "") {
+	while (endIdx > bodyIdx && lines[endIdx]!.trim() === "") {
 		endIdx--;
 	}
 
@@ -179,24 +172,22 @@ function resolveShellBlock(text: string, line: number): BlockSpan | null {
 		"{": "}",
 		"((": "))",
 	};
-	const trimmed = lines[idx].trimStart();
-	const keyword = trimmed.split(/\s/)[0];
+	const trimmed = lines[idx]!.trimStart();
+	const keyword = (trimmed.split(/\s/)[0]!) as string;
 
 	if (!openers[keyword] && !trimmed.startsWith("{")) return null;
 
 	if (trimmed.startsWith("{")) {
-		// Fall back to brace counting
 		return resolveBraceBlock(text, line);
 	}
 
-	const closer = openers[keyword];
+	const closer = openers[keyword]!;
 	if (!closer) return null;
 
 	// Simple keyword counting (handles nested structures)
 	let depth = 1;
 	for (let i = idx + 1; i < lines.length; i++) {
-		const firstWord = lines[i].trimStart().split(/\s/)[0];
-		if (firstWord === keyword) depth++;
+		const firstWord = lines[i]!.trimStart().split(/\s/)[0]!;
 		if (firstWord === closer) {
 			depth--;
 			if (depth === 0) return { start: line, end: i + 1 };
@@ -211,14 +202,13 @@ function resolveMarkdownBlock(text: string, line: number): BlockSpan | null {
 	const idx = line - 1;
 	if (idx < 0 || idx >= lines.length) return null;
 
-	const headerMatch = lines[idx].match(/^(#{1,6})\s/);
+	const headerMatch = lines[idx]!.match(/^(#{1,6})\s/);
 	if (!headerMatch) return null;
 
-	const headerLevel = headerMatch[1].length;
-	// Find the next heading at same or higher level
+	const headerLevel = headerMatch[1]!.length;
 	for (let i = idx + 1; i < lines.length; i++) {
-		const match = lines[i].match(/^(#{1,6})\s/);
-		if (match && match[1].length <= headerLevel) {
+		const match = lines[i]!.match(/^(#{1,6})\s/);
+		if (match && match[1]!.length <= headerLevel) {
 			return { start: line, end: i }; // End just before next heading
 		}
 	}
@@ -229,7 +219,6 @@ export function createBlockResolver(): BlockResolver {
 	return (request): BlockSpan | null => {
 		const lang = classify(request.path);
 		if (!lang) return null;
-
 		switch (lang) {
 			case "brace":
 				return resolveBraceBlock(request.text, request.line);

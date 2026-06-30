@@ -11,8 +11,8 @@
  *   - The before_agent_start hook injects the prompt
  */
 
-import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { writeFile, readFile, unlink, mkdir, rmdir } from "node:fs/promises";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { writeFile, readFile, mkdir, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -184,7 +184,7 @@ describe("edit tool override", () => {
 		expect(result.content).toBeDefined();
 		const text = result.content[0].text as string;
 		// Should contain fresh header after successful edit
-		expect(text).toContain(`[${filePath}`);
+		expect(text).toContain("[edit-test.ts");
 
 		// Verify the file was actually changed
 		const updated = await readFile(filePath, "utf-8");
@@ -252,7 +252,7 @@ describe("grep tool override", () => {
 
 // ---------- DiskFilesystem Tests ----------
 
-import { unlink as fsUnlink, rename, mkdir as fsMkdir } from "node:fs/promises";
+import { unlink as fsUnlink, rename } from "node:fs/promises";
 
 /**
  * Minimal standalone DiskFilesystem test (imported inline from edit.ts logic).

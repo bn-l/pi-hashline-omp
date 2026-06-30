@@ -37,10 +37,18 @@
     "typebox": "*"
   },
   "scripts": {
-    "test": "bun test"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "typescript": "^5.0.0"
+    "@vitest/coverage-v8": "^4.1.9",
+    "oxlint": "^1.70.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.9"
   }
 }

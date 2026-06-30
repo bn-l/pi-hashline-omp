@@ -9,7 +9,7 @@
  *   - Snapshot store → records and retrieves file snapshots
  */
 
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect } from "vitest";
 import {
 	computeFileHash,
 	formatHashlineHeader,

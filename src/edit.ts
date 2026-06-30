@@ -50,45 +50,50 @@ class DiskFilesystem extends Filesystem {
 	}
 
 	async readText(p: string): Promise<string> {
-		return readFile(p, "utf-8");
+		return readFile(this.canonicalPath(p), "utf-8");
 	}
 
 	async writeText(p: string, content: string): Promise<WriteResult> {
-		// Atomic write via temp file, serialized per path
+		const cp = this.canonicalPath(p);
 		const op = async (): Promise<WriteResult> => {
-			const dir = dirname(p);
+			const dir = dirname(cp);
 			const tmp = `${dir}/.pi-hashline-${randomUUID()}.tmp`;
 			try {
 				await writeFile(tmp, content, "utf-8");
-				await rename(tmp, p);
+				await rename(tmp, cp);
 			} catch (e) {
 				try { await unlink(tmp); } catch {}
 				throw e;
 			}
 			return { text: content };
 		};
-		return this.enqueue(p, op);
+		return this.enqueue(cp, op);
 	}
 
 	async delete(p: string): Promise<void> {
-		await this.enqueue(p, async () => { await unlink(p); });
+		const cp = this.canonicalPath(p);
+		await this.enqueue(cp, async () => { await unlink(cp); });
 	}
 
 	async move(source: string, dest: string, content: string): Promise<void> {
-		await this.enqueue(source, async () => {
-			await writeFile(dest, content, "utf-8");
-			await unlink(source);
+		const cs = this.canonicalPath(source);
+		const cd = this.canonicalPath(dest);
+		await this.enqueue(cs, async () => {
+			await writeFile(cd, content, "utf-8");
+			await unlink(cs);
 		});
 	}
 
 	async exists(p: string): Promise<boolean> {
 		try {
-			await access(p, constants.R_OK);
+			await access(this.canonicalPath(p), constants.R_OK);
 			return true;
 		} catch {
 			return false;
 		}
 	}
+
+
 
 	async preflightWrite(path: string, _options?: { fileOp?: { kind: string } }): Promise<void> {
 		// Verify path is within the workspace cwd
@@ -205,7 +210,7 @@ export function registerEditTool(
 				const noopSections = result.sections.filter(s => s.op === "noop");
 				if (noopSections.length === result.sections.length) {
 					// All no-ops — check loop guard
-					const firstPath = noopSections[0].canonicalPath;
+					const firstPath = noopSections[0]!.canonicalPath;
 					const inputHash = computeFileHash(params.input);
 					const record = noopCounts.get(firstPath);
 					if (record && record.hash === inputHash) {
@@ -215,7 +220,7 @@ export function registerEditTool(
 							return {
 								content: [{
 									type: "text",
-									text: `STOP. Edits to ${noopSections[0].path} have been a byte-identical no-op ${NOOP_HARD_LIMIT} times in a row. The file already contains your intended changes, or your anchor is wrong. Re-read the file before issuing another edit.`,
+									text: `STOP. Edits to ${noopSections[0]!.path} have been a byte-identical no-op ${NOOP_HARD_LIMIT} times in a row. The file already contains your intended changes, or your anchor is wrong. Re-read the file before issuing another edit.`,
 								}],
 								details: {},
 							};
@@ -226,7 +231,7 @@ export function registerEditTool(
 					return {
 						content: [{
 							type: "text",
-							text: `Edits to ${noopSections[0].path} produced no change — your body rows are byte-identical to the file. Re-read the file before issuing another edit. Do NOT widen the payload.`,
+							text: `Edits to ${noopSections[0]!.path} produced no change — your body rows are byte-identical to the file. Re-read the file before issuing another edit. Do NOT widen the payload.`,
 						}],
 						details: {},
 					};
