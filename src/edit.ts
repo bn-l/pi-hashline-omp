@@ -11,13 +11,12 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
 import {
 	Patcher,
 	Patch,
 	buildCompactDiffPreview,
 	computeFileHash,
-	formatHashlineHeader,
 	type BlockResolver,
 	type Filesystem,
 	type InMemorySnapshotStore,
@@ -25,7 +24,7 @@ import {
 } from "@oh-my-pi/hashline";
 import { readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import * as Diff from "diff";
 
 /**
  * Minimal Filesystem implementation backed by the real disk.
@@ -74,6 +73,42 @@ class DiskFilesystem implements Filesystem {
 	allowTagPathRecovery(_authoredPath: string, _recoveredPath: string): boolean {
 		return true;
 	}
+}
+
+/** Convert Diff.structuredPatch hunks to hashline numbered-diff format: +N|text / -N|text /  N|text */
+function toNumberedDiff(before: string, after: string): string {
+	const patch = Diff.structuredPatch("file", "file", before, after, "", "", { context: 3 });
+	const lines: string[] = [];
+	for (const hunk of patch.hunks) {
+		let oldLine = hunk.oldStart;
+		let newLine = hunk.newStart;
+		for (const line of hunk.lines) {
+			const kind = line[0];
+			const content = line.slice(1);
+			if (kind === "+") { lines.push(`+${newLine}|${content}`); newLine++; }
+			else if (kind === "-") { lines.push(`-${oldLine}|${content}`); oldLine++; }
+			else { lines.push(` ${oldLine}|${content}`); oldLine++; newLine++; }
+		}
+	}
+	return lines.join("\n");
+}
+
+/** Convert Diff.structuredPatch hunks to Pi TUI display-diff format: +N text / -N text /  N text */
+function toDisplayDiff(before: string, after: string): string {
+	const patch = Diff.structuredPatch("file", "file", before, after, "", "", { context: 3 });
+	const lines: string[] = [];
+	for (const hunk of patch.hunks) {
+		let oldLine = hunk.oldStart;
+		let newLine = hunk.newStart;
+		for (const line of hunk.lines) {
+			const kind = line[0];
+			const content = line.slice(1);
+			if (kind === "+") { lines.push(`+${newLine} ${content}`); newLine++; }
+			else if (kind === "-") { lines.push(`-${oldLine} ${content}`); oldLine++; }
+			else { lines.push(` ${oldLine} ${content}`); oldLine++; newLine++; }
+		}
+	}
+	return lines.join("\n");
 }
 
 let noopCounts = new Map<string, { hash: string; count: number }>();
@@ -166,8 +201,10 @@ export function registerEditTool(
 					}
 				}
 
-				// Build compact output
+				// Build output: content (model-facing anchors) + details.diff (TUI display)
 				const parts: string[] = [];
+				const diffs: string[] = [];
+				let firstChangedLine: number | undefined;
 				for (const section of result.sections) {
 					if (section.op === "delete") {
 						parts.push(`Deleted ${section.path}`);
@@ -175,10 +212,16 @@ export function registerEditTool(
 					}
 					if (section.op === "noop") continue;
 
-					const preview = buildCompactDiffPreview(
-						// We need a diff string for preview
-						section.before === section.after ? "" : `${section.path}: changed`
-					);
+					// Generate proper numbered diff for compact preview (model-facing)
+					const numberedDiff = toNumberedDiff(section.before, section.after);
+					const compact = buildCompactDiffPreview(numberedDiff);
+
+					// Generate display diff for TUI
+					const displayDiff = toDisplayDiff(section.before, section.after);
+					if (displayDiff) diffs.push(displayDiff);
+					if (firstChangedLine === undefined && compact.addedLines + compact.removedLines > 0) {
+						firstChangedLine = result.sections.find(s => s.op !== "noop" && s.op !== "delete")?.firstChangedLine;
+					}
 
 					const blockResolutions = section.blockResolutions
 						?.map(r => {
@@ -193,14 +236,20 @@ export function registerEditTool(
 
 					const moveBlock = section.moveDest ? `\nMoved to ${section.moveDest}` : "";
 
-					parts.push(
-						`${section.header}${blockResolutions ? "\n" + blockResolutions : ""}${moveBlock}${warningsBlock}`
-					);
+					// Content: header + block resolutions + compact preview (model anchoring)
+					const contentBlock = compact.preview
+						? `${section.header}${blockResolutions ? "\n" + blockResolutions : ""}${moveBlock}${warningsBlock}\n${compact.preview}`
+						: `${section.header}${blockResolutions ? "\n" + blockResolutions : ""}${moveBlock}${warningsBlock}`;
+					parts.push(contentBlock);
 				}
 
+				const contentText = parts.join("\n\n") || "No changes made.";
 				return {
-					content: [{ type: "text", text: parts.join("\n\n") || "No changes made." }],
-					details: result,
+					content: [{ type: "text", text: contentText }],
+					details: {
+						diff: diffs.join("\n"),
+						firstChangedLine,
+					},
 				};
 			} catch (e: any) {
 				const message = e.message ?? String(e);
