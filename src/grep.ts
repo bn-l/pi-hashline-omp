@@ -41,7 +41,7 @@ export function registerGrepTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 			const maxResults = params.maxResults ?? 50;
 
 			// Build ripgrep args
-			const args: string[] = ["--line-number", "--no-heading", "--color=never"];
+			const args: string[] = ["--line-number", "--no-heading", "--with-filename", "--color=never"];
 			if (params.glob) args.push("--glob", params.glob);
 			if (params.caseSensitive === true) args.push("--case-sensitive");
 			else if (params.caseSensitive === false) args.push("--ignore-case");
@@ -54,14 +54,23 @@ export function registerGrepTool(pi: ExtensionAPI, snapshots: InMemorySnapshotSt
 			let output: string;
 			try {
 				const result = spawnSync('rg', args, { timeout: 30000, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
-				if (result.status !== 0 && result.status !== 1) {
-					if (result.status === 2) throw new Error(result.stderr || 'ripgrep error');
+				if (result.error) {
+					return {
+						content: [{ type: "text", text: `rg failed: ${result.error.message}` }],
+						details: { error: result.error.message },
+					};
+				}
+				if (result.status === 2) {
+					return {
+						content: [{ type: "text", text: `rg error: ${result.stderr || 'unknown error'}` }],
+						details: { error: result.stderr || 'ripgrep error' },
+					};
 				}
 				output = result.stdout || '';
-			} catch {
+			} catch (e: any) {
 				return {
-					content: [{ type: "text", text: `No matches found for: ${params.pattern}` }],
-					details: { matches: 0 },
+					content: [{ type: "text", text: `rg spawn failed: ${e.message}` }],
+					details: { error: e.message },
 				};
 			}
 
