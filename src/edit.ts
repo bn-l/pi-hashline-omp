@@ -330,7 +330,7 @@ export function registerEditTool(
 
 					// Generate display diff for TUI
 					const displayDiff = toDisplayDiff(section.before, section.after);
-					if (displayDiff) diffs.push(displayDiff);
+					if (displayDiff) diffs.push(`\x1b[2;3m${section.path}\x1b[0m\n${displayDiff}`);
 					if (firstChangedLine === undefined && compact.addedLines + compact.removedLines > 0) {
 						firstChangedLine = result.sections.find(s => s.op !== "noop" && s.op !== "delete")?.firstChangedLine;
 					}
